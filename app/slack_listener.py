@@ -9,7 +9,6 @@ import pytesseract
 import fitz
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-
 from app.utils.slack_utils import is_admin
 from .openai_utils import ask_gpt
 from dotenv import load_dotenv
@@ -42,22 +41,21 @@ def handle_user_message(body, client, logger):
         user_id = event.get("user")
         message_text = event.get("text", "").strip()
         files = event.get("files", [])
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts", event.get("ts"))  # Reply in thread if already part of one
 
         if subtype == "bot_message":
-            return  # Ignore messages sent by the bot
+            return  # Ignore bot messages
 
-        # ✅ Step 1: Open a DM channel with the user
-        dm = client.conversations_open(users=user_id)
-        channel_id = dm["channel"]["id"]
-
-        # ✅ Step 2: Send a temporary "thinking..." message
+        # Step 1: Show "thinking..." message
         thinking_msg = client.chat_postMessage(
             channel=channel_id,
+            thread_ts=thread_ts,
             text="🤔 Thinking... please wait a moment."
         )
         thinking_ts = thinking_msg["ts"]
 
-        # ✅ Step 3: Extract text from file if any
+        # Step 2: Extract file content if provided
         text = ""
         if files:
             f = files[0]
@@ -78,15 +76,19 @@ def handle_user_message(body, client, logger):
 
             if filetype == "text":
                 text = response.text
+
             elif filetype == "docx":
                 doc = Document(BytesIO(response.content))
                 text = "\n".join(p.text for p in doc.paragraphs)
+
             elif filetype in ["png", "jpg", "jpeg"]:
                 image = Image.open(BytesIO(response.content))
                 text = pytesseract.image_to_string(image)
+
             elif filetype == "pdf":
                 pdf = fitz.open(stream=BytesIO(response.content), filetype="pdf")
                 text = "".join([page.get_text() for page in pdf])
+
             else:
                 client.chat_update(
                     channel=channel_id,
@@ -95,11 +97,10 @@ def handle_user_message(body, client, logger):
                 )
                 return
 
-        # ✅ Step 4: Ask GPT with the combined message + file text
-        
-        gpt_reply = ask_gpt(user_message=message_text, file_text=text,slack_user_id=user_id)
+        # Step 3: Ask GPT with message and optional file content
+        gpt_reply = ask_gpt(user_message=message_text, file_text=text, slack_user_id=user_id)
 
-        # ✅ Step 5: Update the original message with GPT response and buttons
+        # Step 4: Update the original message with GPT response and buttons
         client.chat_update(
             channel=channel_id,
             ts=thinking_ts,
@@ -135,13 +136,13 @@ def handle_user_message(body, client, logger):
             ]
         )
 
-        # ✅ Step 6: Get Slack user/org info
+        # Step 5: Get Slack user and team info
         user_info = client.users_info(user=user_id)
         user_name = user_info["user"]["real_name"]
         team_info = client.team_info()
         organization = team_info["team"]["name"]
 
-        # ✅ Step 7: Save to Supabase
+        # Step 6: Save interaction to Supabase
         save_interaction(
             slack_user_id=user_id,
             slack_user_name=user_name,
@@ -149,17 +150,21 @@ def handle_user_message(body, client, logger):
             message_text=message_text,
             extracted_text=text,
             response_text=gpt_reply,
-            prompt_version="GPT-3.5",
+            prompt_version="GPT-4",
             slack_ts=thinking_ts
         )
 
     except Exception as e:
         logger.error(f"❌ Error handling message: {e}")
-        # Fallback error response
+        # Fallback error message to user
         try:
-            client.chat_postMessage(channel=user_id, text="❌ Something went wrong while processing your message.")
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="❌ Something went wrong while processing your message."
+            )
         except Exception as inner:
-            logger.error(f"❌ Failed to send fallback error message: {inner}")
+            logger.error(f"❌ Failed to send fallback message: {inner}")
 
 
 @slack_app.command("/update")
