@@ -68,7 +68,7 @@ def update_feedback(message_ts, feedback):
         print("❌ Failed to update feedback:", response.status_code, response.text)
 
 
-def get_user_interactions(slack_user_id: str, limit: int = 5):
+def get_user_interactions(slack_user_id: str, limit: int = 50):
     url = f"{SUPABASE_URL}/rest/v1/interactions"
     headers = {
         "apikey": SUPABASE_KEY,
