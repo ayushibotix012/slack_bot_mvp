@@ -51,7 +51,7 @@ def handle_user_message(body, client, logger):
         thinking_msg = client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            text="🤔 Thinking... please wait a moment."
+            text="🤔 Analysing...."
         )
         thinking_ts = thinking_msg["ts"]
 
@@ -184,7 +184,7 @@ def handle_update_prompt_command(ack, body, respond: Respond, client: WebClient)
         is_admin = user_info["user"]["is_admin"]
         is_owner = user_info["user"].get("is_owner", False)
 
-        if not (is_admin or is_owner):
+        if  (is_admin or is_owner):
             respond("❌ You are not authorized to update the system prompt.")
             return
 
