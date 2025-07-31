@@ -19,6 +19,26 @@ from slack_bolt.context.respond import Respond
 from slack_sdk.web import WebClient
 from app.db.supabase_client import clear_user_interactions
 from app.db.supabase_client import clear_all_interactions
+import requests
+from io import BytesIO
+from PIL import Image
+from docx import Document
+import fitz  # PyMuPDF
+import pytesseract
+from app.db.supabase_client import save_interaction
+
+#------------------Langchain Rag implementation ----------------
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.chat_models import ChatOpenAI
+
+
+
+#-----------------------------------#
+#Added Vector store 
+from app.vector_store_utils import add_to_vector_store, query_vector_store
+from app.vector_store_utils import load_vector_store
+
 
 
 
@@ -26,137 +46,161 @@ load_dotenv()
 
 slack_app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 
-# Respond to a simple hello message
-@slack_app.message("hello")
-def handle_hello_message(message, say):
-    user = message["user"]
-    say(f"Hi <@{user}>! 👋 This is StakeholderBot.")
 
-# 🔄 Handle file uploads sent via DM (file_share subtype in message event)
+
+
+# Tokenizer-aware chunking function
+def split_text_into_chunks(text, chunk_size=3000, chunk_overlap=200):
+    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        model_name="gpt-4",
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+    return splitter.split_text(text)
+
+
+
+# Respond to a simple hello message
+# @slack_app.message("hello")
+# def handle_hello_message(message, say):
+#     user = message["user"]
+#     say(f"Hi <@{user}>! 👋 This is StakeholderBot.")
+
 @slack_app.event("message")
 def handle_user_message(body, client, logger):
     try:
+        load_vector_store()
         event = body.get("event", {})
         subtype = event.get("subtype", "")
         user_id = event.get("user")
-        message_text = event.get("text", "").strip()
+        raw_text = event.get("text", "")
+        message_text = raw_text.strip() if isinstance(raw_text, str) else ""
         files = event.get("files", [])
         channel_id = event.get("channel")
-        thread_ts = event.get("thread_ts", event.get("ts"))  # Reply in thread if already part of one
+        thread_ts = event.get("thread_ts", event.get("ts"))
 
         if subtype == "bot_message":
-            return  # Ignore bot messages
+            return
 
-        # Step 1: Show "thinking..." message
         thinking_msg = client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            text="🤔 Analysing...."
+            text="🤔 Analyzing your message and files..."
         )
         thinking_ts = thinking_msg["ts"]
 
-        # Step 2: Extract file content if provided
-        text = ""
-        if files:
-            f = files[0]
-            file_url = f.get("url_private_download")
-            filetype = f.get("filetype")
-            filename = f.get("name")
+        # Step 2: Extract text
+        extracted_texts = []
+        headers = {"Authorization": f"Bearer {os.getenv('SLACK_BOT_TOKEN')}"}
 
-            headers = {"Authorization": f"Bearer {os.getenv('SLACK_BOT_TOKEN')}"}
-            response = requests.get(file_url, headers=headers)
+        for f in files:
+            try:
+                file_url = f.get("url_private_download")
+                filetype = f.get("filetype")
+                filename = f.get("name")
+                logger.info(f"📥 Downloading: {filename}")
+                response = requests.get(file_url, headers=headers)
 
-            if response.status_code != 200:
-                client.chat_update(
-                    channel=channel_id,
-                    ts=thinking_ts,
-                    text=f"❌ Failed to download `{filename}`."
-                )
-                return
+                if response.status_code != 200:
+                    logger.error(f"❌ Failed to download {filename} (status {response.status_code})")
+                    continue
 
-            if filetype == "text":
-                text = response.text
+                if filetype == "text":
+                    extracted_texts.append(response.text)
+                elif filetype == "docx":
+                    doc = Document(BytesIO(response.content))
+                    extracted_texts.append("\n".join(p.text for p in doc.paragraphs))
+                elif filetype in ["png", "jpg", "jpeg"]:
+                    image = Image.open(BytesIO(response.content))
+                    extracted_texts.append(pytesseract.image_to_string(image))
+                elif filetype == "pdf":
+                    pdf = fitz.open(stream=BytesIO(response.content), filetype="pdf")
+                    extracted_texts.append("".join([page.get_text() for page in pdf]))
+                else:
+                    logger.warning(f"⚠️ Unsupported file type: {filetype}")
+                    extracted_texts.append(f"[Unsupported file type: {filetype}]")
 
-            elif filetype == "docx":
-                doc = Document(BytesIO(response.content))
-                text = "\n".join(p.text for p in doc.paragraphs)
+            except Exception as file_error:
+                logger.error(f"❌ Error parsing {filename}: {file_error}")
 
-            elif filetype in ["png", "jpg", "jpeg"]:
-                image = Image.open(BytesIO(response.content))
-                text = pytesseract.image_to_string(image)
+        # Step 3: Combine and clean
+        extracted_texts = [text for text in extracted_texts if isinstance(text, str)]
+        extracted_combined_text = "\n\n".join(extracted_texts)
 
-            elif filetype == "pdf":
-                pdf = fitz.open(stream=BytesIO(response.content), filetype="pdf")
-                text = "".join([page.get_text() for page in pdf])
+        # Step 4: Chunk and store in vector DB
+        try:
+            if extracted_combined_text.strip():
+                logger.info("🧩 Splitting document into chunks...")
+                chunks = split_text_into_chunks(extracted_combined_text, chunk_size=3000, chunk_overlap=200)
+                logger.info(f"📚 Adding {len(chunks)} chunks to vector store...")
+                add_to_vector_store(chunks)
+        except Exception as store_error:
+            logger.error(f"❌ Error adding to vector store: {store_error}")
+            client.chat_update(
+                channel=channel_id,
+                ts=thinking_ts,
+                text="❌ Could not index the document. Please try again with a supported format."
+            )
+            return
 
-            else:
-                client.chat_update(
-                    channel=channel_id,
-                    ts=thinking_ts,
-                    text=f"⚠️ Unsupported file type: `{filetype}`"
-                )
-                return
+        # Step 5: Retrieve from vector store (RAG)
+        try:
+            logger.info("🔍 Querying vector store...")
+            retrieved_context = query_vector_store(message_text)
+        except Exception as rag_error:
+            logger.error(f"❌ Error querying vector store: {rag_error}")
+            client.chat_update(
+                channel=channel_id,
+                ts=thinking_ts,
+                text="❌ Could not retrieve relevant content. Please retry."
+            )
+            return
 
-        # Step 3: Ask GPT with message and optional file content
-        gpt_reply = ask_gpt(user_message=message_text, file_text=text, slack_user_id=user_id)
+        # Step 6: Ask GPT with vector context
+        final_response = ask_gpt(
+            user_message=message_text,
+            file_text=retrieved_context,
+            slack_user_id=user_id
+        )
 
-        # Step 4: Update the original message with GPT response and buttons
+        # ✅ Step 6.5: Update Slack message with final GPT response
         client.chat_update(
             channel=channel_id,
             ts=thinking_ts,
-            text=f"{gpt_reply[:1000]}",
+            text=final_response[:1000],
             blocks=[
                 {
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"{gpt_reply[:1000]}"}
+                    "text": {"type": "mrkdwn", "text": final_response[:1000]}
                 },
                 {
                     "type": "actions",
                     "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "👍"},
-                            "value": "thumbs_up",
-                            "action_id": "feedback_like"
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "👎"},
-                            "value": "thumbs_down",
-                            "action_id": "feedback_dislike"
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "❌"},
-                            "value": "irrelevant",
-                            "action_id": "feedback_error"
-                        }
+                        {"type": "button", "text": {"type": "plain_text", "text": "👍"}, "value": "thumbs_up", "action_id": "feedback_like"},
+                        {"type": "button", "text": {"type": "plain_text", "text": "👎"}, "value": "thumbs_down", "action_id": "feedback_dislike"},
+                        {"type": "button", "text": {"type": "plain_text", "text": "❌"}, "value": "irrelevant", "action_id": "feedback_error"}
                     ]
                 }
             ]
         )
 
-        # Step 5: Get Slack user and team info
+        # Step 7: Save to Supabase
+        from app.db.supabase_client import save_interaction
         user_info = client.users_info(user=user_id)
-        user_name = user_info["user"]["real_name"]
         team_info = client.team_info()
-        organization = team_info["team"]["name"]
-
-        # Step 6: Save interaction to Supabase
         save_interaction(
             slack_user_id=user_id,
-            slack_user_name=user_name,
-            organization=organization,
+            slack_user_name=user_info["user"]["real_name"],
+            organization=team_info["team"]["name"],
             message_text=message_text,
-            extracted_text=text,
-            response_text=gpt_reply,
-            prompt_version="GPT-4",
+            extracted_text=extracted_combined_text,
+            response_text=final_response,
+            prompt_version="RAG-GPT4",
             slack_ts=thinking_ts
         )
 
     except Exception as e:
         logger.error(f"❌ Error handling message: {e}")
-        # Fallback error message to user
         try:
             client.chat_postMessage(
                 channel=channel_id,
@@ -165,6 +209,8 @@ def handle_user_message(body, client, logger):
             )
         except Exception as inner:
             logger.error(f"❌ Failed to send fallback message: {inner}")
+
+
 
 
 @slack_app.command("/update")
@@ -177,7 +223,6 @@ def handle_update_prompt_command(ack, body, respond: Respond, client: WebClient)
     if not new_prompt:
         respond("⚠️ Please provide a new prompt.")
         return
-
     try:
         # Fetch user info from Slack
         user_info = client.users_info(user=user_id)

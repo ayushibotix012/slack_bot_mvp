@@ -1,60 +1,78 @@
 import os
 import openai
+import traceback
 from dotenv import load_dotenv
 from pathlib import Path
-from .db.prompt_repo import get_system_prompt
-from .db.supabase_client import get_user_interactions  # ✅ Get past chats from DB
 
+from app.db.prompt_repo import get_system_prompt
+from app.db.supabase_client import get_user_interactions
+
+from app.vector_store_utils import query_vector_store
+
+# Load environment variables
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
-
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+import tiktoken
+
+def num_tokens_from_string(text: str, model: str = "gpt-4") -> int:
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
+
+def trim_text_to_token_limit(text: str, max_tokens: int) -> str:
+    encoding = tiktoken.encoding_for_model("gpt-4")
+    tokens = encoding.encode(text)
+    trimmed = tokens[:max_tokens]
+    return encoding.decode(trimmed)
+
 def ask_gpt(user_message: str, file_text: str, slack_user_id: str) -> str:
-    # ✅ Load system prompt from DB
     base_system_prompt = get_system_prompt()
+    history = get_user_interactions(slack_user_id=slack_user_id, limit=50)
 
-    # ✅ Load past messages + extracted file texts from DB
-    history = get_user_interactions(slack_user_id=slack_user_id, limit=20)
+    try:
+        rag_context = query_vector_store(user_message)
+    except Exception as e:
+        rag_context = ""
+        print("⚠️ Vector store query failed:", e)
 
-    # ✅ Combine extracted file content from past interactions
-    extracted_blobs = [item["extracted_text"] for item in history if item.get("extracted_text")]
-    extracted_context = "\n\n".join(extracted_blobs)
+    # ✅ Truncate to safe limits
+    rag_context = trim_text_to_token_limit(rag_context, 2000)
+    file_text = trim_text_to_token_limit(file_text, 2000)
 
-    # ✅ Final system prompt including extracted context
     system_prompt = f"""{base_system_prompt}
 
-Relevant extracted context from previous documents or images (if applicable):
-{extracted_context[:3000]}
+You have access to relevant content retrieved from the document vector store.
+Use this context only if it's helpful to the user's message.
+
+Vector Store Context:
+{rag_context}
 """
 
-    # ✅ Instruction for GPT on how to treat file content
-    instruction = """The user may provide a message along with optional file content (e.g., a document, image, or PDF). 
-Only use the file content if the user's message clearly refers to or depends on the file. 
-If the message does not mention or relate to the file, completely ignore the file and respond based only on the message.
-Be precise in your judgment. If the file appears unrelated to the question, treat it as irrelevant."""
-
-    # ✅ Start building the GPT message list
     messages = [{"role": "system", "content": system_prompt}]
 
-    # ✅ Add previous chat history (user + assistant) in order
+    # Only add history if total token count permits
+    total_tokens = num_tokens_from_string(system_prompt + user_message + file_text)
     for interaction in reversed(history):
-        messages.append({"role": "user", "content": interaction["message_text"]})
-        messages.append({"role": "assistant", "content": interaction["response_text"]})
+        if total_tokens >= 7000:
+            break
+        user_q = interaction["message_text"]
+        assistant_a = interaction["response_text"]
+        messages.append({"role": "user", "content": user_q})
+        messages.append({"role": "assistant", "content": assistant_a})
+        total_tokens += num_tokens_from_string(user_q + assistant_a)
 
-    # ✅ Combine current message and file content (if any)
+    # Final user message
     if file_text:
-        combined_message = f"""User message: {user_message} + {instruction}
+        final_user_prompt = f"""{user_message}
 
-File content:
-{file_text[:3000]}
+Below is the text extracted from the uploaded file (if relevant):
+{file_text}
 """
     else:
-        combined_message = user_message
+        final_user_prompt = user_message
 
-    # ✅ Append current query to the message list
-    messages.append({"role": "user", "content": combined_message})
+    messages.append({"role": "user", "content": final_user_prompt})
 
-    # ✅ Send to OpenAI
     try:
         response = openai.ChatCompletion.create(
             model="gpt-4",
@@ -64,5 +82,7 @@ File content:
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"❌ OpenAI API Error: {e}")
+        print("❌ OpenAI API Error:")
+        traceback.print_exc()
         return "❌ Failed to get a response from GPT."
+
