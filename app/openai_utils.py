@@ -75,7 +75,7 @@ Below is the text extracted from the uploaded file (if relevant):
 
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-4",
+            model="gpt-4o",
             messages=messages,
             temperature=0.7
         )

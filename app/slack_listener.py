@@ -229,7 +229,7 @@ def handle_update_prompt_command(ack, body, respond: Respond, client: WebClient)
         is_admin = user_info["user"]["is_admin"]
         is_owner = user_info["user"].get("is_owner", False)
 
-        if  (is_admin or is_owner):
+        if  not (is_admin or is_owner):
             respond("❌ You are not authorized to update the system prompt.")
             return
 
