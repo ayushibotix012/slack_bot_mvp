@@ -17,7 +17,11 @@ def load_vector_store():
     """
     global vector_store
     if os.path.exists(os.path.join(FAISS_FOLDER, "index.faiss")):
-        vector_store = FAISS.load_local(FAISS_FOLDER, embedding_model, allow_dangerous_deserialization=True)
+        vector_store = FAISS.load_local(
+            FAISS_FOLDER, 
+            embedding_model, 
+            allow_dangerous_deserialization=True
+        )
     else:
         vector_store = None
 
@@ -31,23 +35,33 @@ def save_vector_store():
 
 def add_to_vector_store(chunks: list[str]):
     """
-    Replace the current vector store with new chunks and save.
+    Append new chunks to the existing vector store instead of overwriting.
     """
     global vector_store
 
     if not chunks:
         return
 
-    # 🧹 Overwrite previous index completely
-    vector_store = FAISS.from_texts(chunks, embedding_model)
+    # Ensure we have the existing store loaded
+    load_vector_store()
+
+    if vector_store:
+        # Append to existing index
+        vector_store.add_texts(chunks)
+    else:
+        # Create new index
+        vector_store = FAISS.from_texts(chunks, embedding_model)
 
     save_vector_store()
 
-def query_vector_store(query: str, k: int = 5) -> str:
+def query_vector_store(query: str, k: int = 10) -> str:
     """
     Retrieve top-k relevant chunks for a query.
     """
     global vector_store
+
+    if vector_store is None:
+        load_vector_store()
 
     if vector_store is None:
         return "⚠️ Vector store is empty. Please upload documents first."

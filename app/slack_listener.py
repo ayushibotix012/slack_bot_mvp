@@ -19,35 +19,17 @@ from slack_bolt.context.respond import Respond
 from slack_sdk.web import WebClient
 from app.db.supabase_client import clear_user_interactions
 from app.db.supabase_client import clear_all_interactions
-import requests
-from io import BytesIO
-from PIL import Image
-from docx import Document
-import fitz  # PyMuPDF
-import pytesseract
-from app.db.supabase_client import save_interaction
 
-#------------------Langchain Rag implementation ----------------
+# ------------------ LangChain RAG implementation ----------------
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.chat_models import ChatOpenAI
 
-
-
-#-----------------------------------#
-#Added Vector store 
-from app.vector_store_utils import add_to_vector_store, query_vector_store
-from app.vector_store_utils import load_vector_store
-
-
-
+# ----------------------------------- #
+# Vector store
+from app.vector_store_utils import add_to_vector_store, load_vector_store
 
 load_dotenv()
 
 slack_app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-
-
-
 
 # Tokenizer-aware chunking function
 def split_text_into_chunks(text, chunk_size=3000, chunk_overlap=200):
@@ -58,13 +40,6 @@ def split_text_into_chunks(text, chunk_size=3000, chunk_overlap=200):
     )
     return splitter.split_text(text)
 
-
-
-# Respond to a simple hello message
-# @slack_app.message("hello")
-# def handle_hello_message(message, say):
-#     user = message["user"]
-#     say(f"Hi <@{user}>! 👋 This is StakeholderBot.")
 
 @slack_app.event("message")
 def handle_user_message(body, client, logger):
@@ -89,49 +64,72 @@ def handle_user_message(body, client, logger):
         )
         thinking_ts = thinking_msg["ts"]
 
-        # Step 2: Extract text
+        # -------- Step 2: Extract text (for RAG) and collect raw images (for GPT-4o vision) --------
         extracted_texts = []
+        image_blobs = []  # NEW: raw image bytes to pass to ask_gpt
         headers = {"Authorization": f"Bearer {os.getenv('SLACK_BOT_TOKEN')}"}
 
-        for f in files:
+        for f in files or []:
             try:
                 file_url = f.get("url_private_download")
-                filetype = f.get("filetype")
+                filetype = (f.get("filetype") or "").lower()
+                mimetype = (f.get("mimetype") or "").lower()
                 filename = f.get("name")
                 logger.info(f"📥 Downloading: {filename}")
-                response = requests.get(file_url, headers=headers)
+                resp = requests.get(file_url, headers=headers)
 
-                if response.status_code != 200:
-                    logger.error(f"❌ Failed to download {filename} (status {response.status_code})")
+                if resp.status_code != 200:
+                    logger.error(f"❌ Failed to download {filename} (status {resp.status_code})")
                     continue
 
-                if filetype == "text":
-                    extracted_texts.append(response.text)
-                elif filetype == "docx":
-                    doc = Document(BytesIO(response.content))
+                # Prefer mimetype when filetype is unreliable
+                is_image = (
+                    filetype in ["png", "jpg", "jpeg"]
+                    or mimetype.startswith("image/")
+                )
+
+                if filetype == "text" or mimetype in ["text/plain"]:
+                    extracted_texts.append(resp.text)
+
+                elif filetype == "docx" or mimetype in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
+                    doc = Document(BytesIO(resp.content))
                     extracted_texts.append("\n".join(p.text for p in doc.paragraphs))
-                elif filetype in ["png", "jpg", "jpeg"]:
-                    image = Image.open(BytesIO(response.content))
-                    extracted_texts.append(pytesseract.image_to_string(image))
-                elif filetype == "pdf":
-                    pdf = fitz.open(stream=BytesIO(response.content), filetype="pdf")
+
+                elif is_image:
+                    # Collect raw image bytes for GPT-4o vision
+                    image_blobs.append(resp.content)
+
+                    # Keep OCR as well so screenshots become searchable via RAG
+                    try:
+                        image = Image.open(BytesIO(resp.content))
+                        extracted_texts.append(pytesseract.image_to_string(image))
+                    except Exception as ocr_err:
+                        logger.warning(f"⚠️ OCR failed for {filename}: {ocr_err}")
+
+                elif filetype == "pdf" or mimetype == "application/pdf":
+                    pdf = fitz.open(stream=BytesIO(resp.content), filetype="pdf")
                     extracted_texts.append("".join([page.get_text() for page in pdf]))
+
                 else:
-                    logger.warning(f"⚠️ Unsupported file type: {filetype}")
-                    extracted_texts.append(f"[Unsupported file type: {filetype}]")
+                    logger.warning(f"⚠️ Unsupported file type: {filetype or mimetype}")
+                    extracted_texts.append(f"[Unsupported file type: {filetype or mimetype}]")
 
             except Exception as file_error:
                 logger.error(f"❌ Error parsing {filename}: {file_error}")
 
-        # Step 3: Combine and clean
+        # -------- Step 3: Combine and clean --------
         extracted_texts = [text for text in extracted_texts if isinstance(text, str)]
         extracted_combined_text = "\n\n".join(extracted_texts)
 
-        # Step 4: Chunk and store in vector DB
+        # -------- Step 4: Chunk and store in vector DB (only if we actually extracted text) --------
         try:
             if extracted_combined_text.strip():
                 logger.info("🧩 Splitting document into chunks...")
-                chunks = split_text_into_chunks(extracted_combined_text, chunk_size=3000, chunk_overlap=200)
+                chunks = split_text_into_chunks(
+                    extracted_combined_text,
+                    chunk_size=5000,
+                    chunk_overlap=300
+                )
                 logger.info(f"📚 Adding {len(chunks)} chunks to vector store...")
                 add_to_vector_store(chunks)
         except Exception as store_error:
@@ -143,35 +141,26 @@ def handle_user_message(body, client, logger):
             )
             return
 
-        # Step 5: Retrieve from vector store (RAG)
-        try:
-            logger.info("🔍 Querying vector store...")
-            retrieved_context = query_vector_store(message_text)
-        except Exception as rag_error:
-            logger.error(f"❌ Error querying vector store: {rag_error}")
-            client.chat_update(
-                channel=channel_id,
-                ts=thinking_ts,
-                text="❌ Could not retrieve relevant content. Please retry."
-            )
-            return
+        # -------- Step 5: (Removed duplicate RAG here) --------
+        # We let ask_gpt() handle RAG internally to avoid duplicate context & token bloat.
 
-        # Step 6: Ask GPT with vector context
+        # -------- Step 6: Ask GPT with user message + file text + images --------
         final_response = ask_gpt(
             user_message=message_text,
-            file_text=retrieved_context,
-            slack_user_id=user_id
+            file_text=extracted_combined_text or "",  # pass actual extracted text (if any)
+            slack_user_id=user_id,
+            images=image_blobs if image_blobs else None  # NEW
         )
 
         # ✅ Step 6.5: Update Slack message with final GPT response
         client.chat_update(
             channel=channel_id,
             ts=thinking_ts,
-            text=final_response[:1000],
+            text=final_response,
             blocks=[
                 {
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": final_response[:1000]}
+                    "text": {"type": "mrkdwn", "text": final_response}
                 },
                 {
                     "type": "actions",
@@ -184,8 +173,7 @@ def handle_user_message(body, client, logger):
             ]
         )
 
-        # Step 7: Save to Supabase
-        from app.db.supabase_client import save_interaction
+        # -------- Step 7: Save to Supabase --------
         user_info = client.users_info(user=user_id)
         team_info = client.team_info()
         save_interaction(
@@ -211,8 +199,6 @@ def handle_user_message(body, client, logger):
             logger.error(f"❌ Failed to send fallback message: {inner}")
 
 
-
-
 @slack_app.command("/update")
 def handle_update_prompt_command(ack, body, respond: Respond, client: WebClient):
     ack()
@@ -229,7 +215,7 @@ def handle_update_prompt_command(ack, body, respond: Respond, client: WebClient)
         is_admin = user_info["user"]["is_admin"]
         is_owner = user_info["user"].get("is_owner", False)
 
-        if  not (is_admin or is_owner):
+        if not (is_admin or is_owner):
             respond("❌ You are not authorized to update the system prompt.")
             return
 
@@ -274,11 +260,7 @@ def handle_feedback(ack, body, action, client, logger):
         )
     except Exception as e:
         logger.error("Error updating feedback: %s", e)
-        # client.chat_postEphemeral(
-        #     channel=body["channel"]["id"],
-        #     user=user_id,
-        #     text="❌ Failed to save feedback."
-        # )
+
 
 @slack_app.command("/clear")
 def handle_clear_command(ack, body, respond):
@@ -308,7 +290,6 @@ def handle_clear_all_command(ack, body, client, respond):
         respond("🚨 All interactions have been permanently deleted from the database.")
     else:
         respond("❌ Failed to clear all interactions. Please try again later.")
-
 
 
 # 🔁 Start the socket mode handler
