@@ -19,6 +19,57 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 
+# ----------------- QUERY CLASSIFIER -----------------
+def llm_classify(user_message: str) -> str:
+    """
+    Use GPT for classification when heuristics are uncertain.
+    """
+    try:
+        resp = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a classifier. Return only one word: general, document, image, or mixed."},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0
+        )
+        label = resp.choices[0].message.content.strip().lower()
+        if label in ["general", "document", "image", "mixed"]:
+            return label
+    except Exception:
+        pass
+    return "general"
+
+
+def classify_query(user_message: str, file_text: str, images: list[bytes]) -> str:
+    """
+    Hybrid classifier: Heuristic first, GPT fallback for ambiguous queries.
+    """
+    text = user_message.lower().strip()
+
+    # --- Explicit signals from inputs ---
+    if images and file_text:
+        return "mixed"
+    if images:
+        if any(word in text for word in ["see", "picture", "image", "photo", "screenshot", "visual"]):
+            return "image"
+        return "image"
+    if file_text and file_text.strip():
+        if any(word in text for word in ["document", "file", "pdf", "report", "text inside"]):
+            return "document"
+        return "document"
+
+    # --- General by default ---
+    label = "general"
+
+    # If ambiguous phrasing, let GPT decide
+    if any(word in text for word in ["this", "that", "above", "attached", "uploaded", "shown"]):
+        label = llm_classify(user_message)
+
+    return label
+
+
+# ----------------- MAIN GPT HANDLER -----------------
 def ask_gpt(user_message: str, file_text: str, slack_user_id: str, images: list[bytes] = None) -> str:
     """
     Ask GPT with text + optional image(s) + RAG context.
@@ -52,14 +103,38 @@ def ask_gpt(user_message: str, file_text: str, slack_user_id: str, images: list[
     if extracted_ocr_text.strip():
         combined_extracted_text += "\n\n[OCR Extracted Text]\n" + extracted_ocr_text.strip()
 
-    system_prompt = f"""{base_system_prompt}
+    # --- Classify query type ---
+    query_type = classify_query(user_message, file_text, images)
+    print(f"📝 Query classified as: {query_type}")
 
-You may receive both text and images from the user.
-When images are provided, examine them visually in detail **and** consider the OCR extracted text.
-Combine visual observations with any provided OCR text or vector store context when relevant.
+    # --- Build system prompt with classification ---
+    if rag_context.strip():
+        system_prompt = f"""{base_system_prompt}
+
+Query Type: {query_type}
+
+- If relevant information is found in the **Vector Store Context**, use it to answer the question accurately.
+- If the context is empty or unrelated, respond using your own knowledge.
+- For greetings or casual conversation (e.g. "hi", "hello", "how are you"), reply naturally and politely.
+- If the query type is 'document', focus on the extracted file text.
+- If the query type is 'image', use both OCR and visual analysis.
+- If the query type is 'mixed', combine all sources intelligently.
+- Always give a clear, helpful answer without referencing system details.
 
 Vector Store Context:
 {rag_context}
+"""
+    else:
+        system_prompt = f"""{base_system_prompt}
+
+Query Type: {query_type}
+
+- Answer questions using your own knowledge unless a file or image is provided.
+- For greetings or casual conversation (e.g. "hi", "hello", "how are you"), reply naturally and politely.
+- If the query type is 'document', focus on the extracted file text.
+- If the query type is 'image', use both OCR and visual analysis.
+- If the query type is 'mixed', combine all sources intelligently.
+- Always give a clear, helpful answer without referencing system details.
 """
 
     # Build conversation

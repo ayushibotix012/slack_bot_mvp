@@ -1,7 +1,7 @@
 import os
 from langchain.vectorstores import FAISS
 from langchain.embeddings.openai import OpenAIEmbeddings
-
+import shutil
 # Path to save/load FAISS index
 FAISS_FOLDER = "faiss_index"
 
@@ -69,3 +69,25 @@ def query_vector_store(query: str, k: int = 10) -> str:
     retriever = vector_store.as_retriever(search_kwargs={"k": k})
     docs = retriever.get_relevant_documents(query)
     return "\n\n".join([doc.page_content for doc in docs])
+
+
+
+
+def clear_vector_store():
+    """
+    Clear the FAISS vector store both in memory and on disk.
+    """
+    global vector_store
+    vector_store = None  # Reset in-memory store
+
+    if os.path.exists(FAISS_FOLDER):
+        try:
+            shutil.rmtree(FAISS_FOLDER)  # Delete entire folder
+            print("✅ Vector store cleared successfully.")
+            return True
+        except Exception as e:
+            print(f"⚠️ Failed to clear vector store: {e}")
+            return False
+    else:
+        print("ℹ️ No vector store found to clear.")
+        return False

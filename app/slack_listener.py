@@ -25,7 +25,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # ----------------------------------- #
 # Vector store
-from app.vector_store_utils import add_to_vector_store, load_vector_store
+from app.vector_store_utils import add_to_vector_store, clear_vector_store, load_vector_store
 
 load_dotenv()
 
@@ -268,8 +268,9 @@ def handle_clear_command(ack, body, respond):
 
     user_id = body["user_id"]
     success = clear_user_interactions(user_id)
+    clearVector = clear_vector_store()
 
-    if success:
+    if success and clearVector:
         respond(f"🧹 Your chat history has been cleared from memory.")
     else:
         respond(f"❌ Failed to clear your chat history. Please try again later.")
@@ -285,6 +286,7 @@ def handle_clear_all_command(ack, body, client, respond):
         return
 
     success = clear_all_interactions()
+    
 
     if success:
         respond("🚨 All interactions have been permanently deleted from the database.")
