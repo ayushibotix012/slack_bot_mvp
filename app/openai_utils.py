@@ -2,7 +2,8 @@
 import os
 import base64
 import mimetypes
-import imghdr
+# import imghdr
+import filetype
 import openai
 import traceback
 from dotenv import load_dotenv
@@ -31,10 +32,11 @@ def analyze_image_with_llm(img_bytes: bytes) -> str:
     Analyze an image using GPT-4o and extract text + entities.
     Returns only the extracted response.
     """
-    # Detect image format
-    detected_format = imghdr.what(None, h=img_bytes)
-    mime_type = f"image/{detected_format}" if detected_format else "image/jpeg"
-
+    # # Detect image format
+    # detected_format = imghdr.what(None, h=img_bytes)
+    # mime_type = f"image/{detected_format}" if detected_format else "image/jpeg"
+    kind = filetype.guess(img_bytes)
+    mime_type = f"image/{kind.extension}" if kind else "image/jpeg"
     # Convert image to Base64
     b64_image = base64.b64encode(img_bytes).decode("utf-8")
 
