@@ -10,7 +10,7 @@ import fitz
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from app.utils.slack_utils import is_admin
-from .openai_utils import ask_gpt
+from .openai_utils import ask_gpt, analyze_image_with_llm
 from dotenv import load_dotenv
 from app.db.supabase_client import get_user_interactions, save_interaction
 from slack_sdk.errors import SlackApiError
@@ -41,6 +41,7 @@ def split_text_into_chunks(text, chunk_size=3000, chunk_overlap=200):
     return splitter.split_text(text)
 
 
+# ----------------- SLACK LISTENER -----------------
 @slack_app.event("message")
 def handle_user_message(body, client, logger):
     try:
@@ -64,9 +65,7 @@ def handle_user_message(body, client, logger):
         )
         thinking_ts = thinking_msg["ts"]
 
-        # -------- Step 2: Extract text (for RAG) and collect raw images (for GPT-4o vision) --------
         extracted_texts = []
-        image_blobs = []  # NEW: raw image bytes to pass to ask_gpt
         headers = {"Authorization": f"Bearer {os.getenv('SLACK_BOT_TOKEN')}"}
 
         for f in files or []:
@@ -77,16 +76,11 @@ def handle_user_message(body, client, logger):
                 filename = f.get("name")
                 logger.info(f"📥 Downloading: {filename}")
                 resp = requests.get(file_url, headers=headers)
-
                 if resp.status_code != 200:
                     logger.error(f"❌ Failed to download {filename} (status {resp.status_code})")
                     continue
 
-                # Prefer mimetype when filetype is unreliable
-                is_image = (
-                    filetype in ["png", "jpg", "jpeg"]
-                    or mimetype.startswith("image/")
-                )
+                is_image = filetype in ["png", "jpg", "jpeg"] or mimetype.startswith("image/")
 
                 if filetype == "text" or mimetype in ["text/plain"]:
                     extracted_texts.append(resp.text)
@@ -95,85 +89,69 @@ def handle_user_message(body, client, logger):
                     doc = Document(BytesIO(resp.content))
                     extracted_texts.append("\n".join(p.text for p in doc.paragraphs))
 
-                elif is_image:
-                    # Collect raw image bytes for GPT-4o vision
-                    image_blobs.append(resp.content)
-
-                    # Keep OCR as well so screenshots become searchable via RAG
-                    try:
-                        image = Image.open(BytesIO(resp.content))
-                        extracted_texts.append(pytesseract.image_to_string(image))
-                    except Exception as ocr_err:
-                        logger.warning(f"⚠️ OCR failed for {filename}: {ocr_err}")
-
                 elif filetype == "pdf" or mimetype == "application/pdf":
+                    import fitz
                     pdf = fitz.open(stream=BytesIO(resp.content), filetype="pdf")
                     extracted_texts.append("".join([page.get_text() for page in pdf]))
 
+                elif is_image:
+                    # --- GPT Vision analysis ---
+                    print(resp.content)
+                    gpt_image_text = analyze_image_with_llm(resp.content)
+                    print(gpt_image_text)
+                    print("*************---------------------*************")
+                    extracted_texts.append(gpt_image_text)
+
+                    user_info = client.users_info(user=user_id)
+                    team_info = client.team_info()
+                    save_interaction(
+                        slack_user_id=user_id,
+                        slack_user_name=user_info["user"]["real_name"],
+                        organization=team_info["team"]["name"],
+                        message_text=gpt_image_text,
+                        extracted_text=None,
+                        response_text=None,
+                        prompt_version="RAG-GPT4",
+                        slack_ts=thinking_ts
+                    )
                 else:
                     logger.warning(f"⚠️ Unsupported file type: {filetype or mimetype}")
                     extracted_texts.append(f"[Unsupported file type: {filetype or mimetype}]")
 
-            except Exception as file_error:
-                logger.error(f"❌ Error parsing {filename}: {file_error}")
+            except Exception as file_err:
+                logger.error(f"❌ Error processing {filename}: {file_err}")
 
-        # -------- Step 3: Combine and clean --------
-        extracted_texts = [text for text in extracted_texts if isinstance(text, str)]
-        extracted_combined_text = "\n\n".join(extracted_texts)
+        # Combine extracted text
+        extracted_combined_text = "\n\n".join([t for t in extracted_texts if isinstance(t, str)])
 
-        # -------- Step 4: Chunk and store in vector DB (only if we actually extracted text) --------
-        try:
-            if extracted_combined_text.strip():
-                logger.info("🧩 Splitting document into chunks...")
-                chunks = split_text_into_chunks(
-                    extracted_combined_text,
-                    chunk_size=5000,
-                    chunk_overlap=300
-                )
-                logger.info(f"📚 Adding {len(chunks)} chunks to vector store...")
-                add_to_vector_store(chunks)
-        except Exception as store_error:
-            logger.error(f"❌ Error adding to vector store: {store_error}")
-            client.chat_update(
-                channel=channel_id,
-                ts=thinking_ts,
-                text="❌ Could not index the document. Please try again with a supported format."
-            )
-            return
+        # Add to vector store if we have text
+        if extracted_combined_text.strip():
+            chunks = split_text_into_chunks(extracted_combined_text, chunk_size=5000, chunk_overlap=300)
+            add_to_vector_store(chunks)
 
-        # -------- Step 5: (Removed duplicate RAG here) --------
-        # We let ask_gpt() handle RAG internally to avoid duplicate context & token bloat.
-
-        # -------- Step 6: Ask GPT with user message + file text + images --------
+        # Ask GPT
         final_response = ask_gpt(
             user_message=message_text,
-            file_text=extracted_combined_text or "",  # pass actual extracted text (if any)
-            slack_user_id=user_id,
-            images=image_blobs if image_blobs else None  # NEW
+            file_text=extracted_combined_text,
+            slack_user_id=user_id
         )
 
-        # ✅ Step 6.5: Update Slack message with final GPT response
+        # Update Slack message
         client.chat_update(
             channel=channel_id,
             ts=thinking_ts,
             text=final_response,
             blocks=[
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": final_response}
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {"type": "button", "text": {"type": "plain_text", "text": "👍"}, "value": "thumbs_up", "action_id": "feedback_like"},
-                        {"type": "button", "text": {"type": "plain_text", "text": "👎"}, "value": "thumbs_down", "action_id": "feedback_dislike"},
-                        {"type": "button", "text": {"type": "plain_text", "text": "❌"}, "value": "irrelevant", "action_id": "feedback_error"}
-                    ]
-                }
+                {"type": "section", "text": {"type": "mrkdwn", "text": final_response}},
+                {"type": "actions", "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "👍"}, "value": "thumbs_up", "action_id": "feedback_like"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "👎"}, "value": "thumbs_down", "action_id": "feedback_dislike"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "❌"}, "value": "irrelevant", "action_id": "feedback_error"}
+                ]}
             ]
         )
 
-        # -------- Step 7: Save to Supabase --------
+        # Save full interaction
         user_info = client.users_info(user=user_id)
         team_info = client.team_info()
         save_interaction(
@@ -197,6 +175,7 @@ def handle_user_message(body, client, logger):
             )
         except Exception as inner:
             logger.error(f"❌ Failed to send fallback message: {inner}")
+
 
 
 @slack_app.command("/update")

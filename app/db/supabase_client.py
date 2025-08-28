@@ -1,5 +1,6 @@
 # app/db/supabase_client.py
 
+import json
 import os
 import requests
 from dotenv import load_dotenv
@@ -128,3 +129,53 @@ def clear_all_interactions():
     else:
         print("❌ Failed to clear all interactions:", response.status_code, response.text)
         return False
+
+
+def save_image_context(conversation_id: str, image_id: str, extracted_data: dict):
+    """
+    Save extracted image data (OCR + description + purpose) to Supabase.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/image_contexts"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "conversation_id": conversation_id,
+        "image_id": image_id,
+        "extracted_data": json.dumps(extracted_data)  # stored as JSON in Supabase
+    }
+
+    response = requests.post(url, json=data, headers=headers)
+
+    if response.status_code == 201:
+        print("✅ Image context saved to Supabase.")
+        return response.json()
+    else:
+        print("❌ Failed to save image context:", response.status_code, response.text)
+        return None
+    
+
+def get_image_context(conversation_id: str, image_id: str = None):
+    """
+    Fetch previously saved image context for a conversation (and optionally a specific image).
+    """
+    url = f"{SUPABASE_URL}/rest/v1/image_contexts"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    params = {"conversation_id": f"eq.{conversation_id}"}
+    if image_id:
+        params["image_id"] = f"eq.{image_id}"
+
+    resp = requests.get(url, headers=headers, params=params)
+    if resp.status_code == 200:
+        return resp.json()
+    else:
+        print("❌ Failed to fetch image context:", resp.status_code, resp.text)
+        return []    

@@ -90,4 +90,4 @@ def clear_vector_store():
             return False
     else:
         print("ℹ️ No vector store found to clear.")
-        return False
+        return True

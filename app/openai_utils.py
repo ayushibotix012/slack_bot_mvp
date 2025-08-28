@@ -1,3 +1,4 @@
+
 import os
 import base64
 import mimetypes
@@ -14,9 +15,64 @@ from app.db.prompt_repo import get_system_prompt
 from app.db.supabase_client import get_user_interactions
 from app.vector_store_utils import query_vector_store
 
+from openai import OpenAI
+
 # Load environment variables
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# openai.api_key = os.getenv("OPENAI_API_KEY")
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+
+
+def analyze_image_with_llm(img_bytes: bytes) -> str:
+    """
+    Analyze an image using GPT-4o and extract text + entities.
+    Returns only the extracted response.
+    """
+    # Detect image format
+    detected_format = imghdr.what(None, h=img_bytes)
+    mime_type = f"image/{detected_format}" if detected_format else "image/jpeg"
+
+    # Convert image to Base64
+    b64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+    # System prompt
+    system_prompt = (
+        "You are an expert document/image analyzer.\n"
+        "Your task:\n"
+        "- Extract all text clearly from the image (like OCR).\n"
+        "- Summarize key entities (names, dates, amounts, references).\n"
+        "- If seals, signatures, or logos are present, describe them.\n"
+        "- Maintain structure if possible (tables, sections).\n"
+        "- If image is unclear, say 'Text partially unreadable'."
+    )
+
+    # User message with text + image
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Please analyze this image and explain all of the information in detail."},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}}
+            ],
+        },
+    ]
+
+    # Call GPT-4o
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.5
+    )
+
+    # Return only the text content
+    return response.choices[0].message.content.strip()
+
+
+
 
 
 # ----------------- QUERY CLASSIFIER -----------------
@@ -69,117 +125,87 @@ def classify_query(user_message: str, file_text: str, images: list[bytes]) -> st
     return label
 
 
-# ----------------- MAIN GPT HANDLER -----------------
-def ask_gpt(user_message: str, file_text: str, slack_user_id: str, images: list[bytes] = None) -> str:
+# --- Main GPT handler ---
+def ask_gpt(user_message: str, file_text: str, slack_user_id: str) -> str:
     """
-    Ask GPT with text + optional image(s) + RAG context.
-    If images are provided, OCR will be performed to extract text automatically.
+    Handles GPT response generation using user message, file text, and RAG context.
     """
-    base_system_prompt = get_system_prompt()
-    history = get_user_interactions(slack_user_id=slack_user_id, limit=50)
 
     try:
+        # --- Get system prompt ---
+        base_system_prompt = get_system_prompt()
+
+        # --- Fetch user conversation history ---
+        past_interactions = get_user_interactions(slack_user_id)
+        history_text = ""
+        if past_interactions:
+            for inter in past_interactions[-50:]:  # ✅ keep last 50 interactions
+                extracted_part = f"\nExtracted Info: {inter['extracted_text']}" if inter.get("extracted_text") else ""
+                history_text += (
+                    f"User: {inter['message_text']}\n"
+                    f"Assistant: {inter['response_text']}{extracted_part}\n"
+                )
+
+        # --- RAG Context ---
         rag_context = query_vector_store(user_message)
-    except Exception as e:
-        rag_context = ""
-        print("⚠️ Vector store query failed:", e)
 
-    # --- Auto OCR if images provided ---
-    extracted_ocr_text = ""
-    if images:
-        for img_bytes in images:
-            try:
-                img = Image.open(BytesIO(img_bytes))
-                ocr_text = pytesseract.image_to_string(img)
-                if ocr_text.strip():
-                    extracted_ocr_text += ocr_text.strip() + "\n"
-            except Exception as e:
-                print(f"⚠️ OCR failed for one image: {e}")
+        # --- Build final extracted text ---
+        combined_extracted_text = ""
+        if file_text and file_text.strip():
+            combined_extracted_text += file_text.strip()
 
-    # Prefer file_text, but append OCR text if found
-    combined_extracted_text = ""
-    if file_text and file_text.strip():
-        combined_extracted_text += file_text.strip()
-    if extracted_ocr_text.strip():
-        combined_extracted_text += "\n\n[OCR Extracted Text]\n" + extracted_ocr_text.strip()
+        # --- System prompt with context ---
+        # --- System prompt ---
+        if rag_context.strip():
+            system_prompt = f"""
+        You are a professional and friendly AI assistant. Use all available context to answer queries accurately. 
+        - Use the vector store context when relevant.
+        - Focus on document or file content if the query relates to a file.
+        - Combine conversation history and context intelligently.
+        - Always be polite, professional, and clear.
+        - Avoid mentioning internal system details.
+        Vector Store Context:
+        {rag_context}
+        """
+        else:
+            system_prompt = f"""
+        You are a professional and friendly AI assistant. 
+        - Answer general queries using your knowledge and conversation history.
+        - Provide polite and friendly greetings when appropriate.
+        - Keep answers clear, accurate, and professional.
+        - Avoid referring to vector stores or documents unless they exist.
+        """
 
-    # --- Classify query type ---
-    query_type = classify_query(user_message, file_text, images)
-    print(f"📝 Query classified as: {query_type}")
 
-    # --- Build system prompt with classification ---
-    if rag_context.strip():
-        system_prompt = f"""{base_system_prompt}
+        # --- Final user prompt to GPT ---
+        final_prompt = f"""
+        Conversation History:
+        {history_text}
 
-Query Type: {query_type}
+        User Query:
+        {user_message}
 
-- If relevant information is found in the **Vector Store Context**, use it to answer the question accurately.
-- If the context is empty or unrelated, respond using your own knowledge.
-- For greetings or casual conversation (e.g. "hi", "hello", "how are you"), reply naturally and politely.
-- If the query type is 'document', focus on the extracted file text.
-- If the query type is 'image', use both OCR and visual analysis.
-- If the query type is 'mixed', combine all sources intelligently.
-- Always give a clear, helpful answer without referencing system details.
+        Extracted Text:
+        {combined_extracted_text}
+        """
 
-Vector Store Context:
-{rag_context}
-"""
-    else:
-        system_prompt = f"""{base_system_prompt}
 
-Query Type: {query_type}
-
-- Answer questions using your own knowledge unless a file or image is provided.
-- For greetings or casual conversation (e.g. "hi", "hello", "how are you"), reply naturally and politely.
-- If the query type is 'document', focus on the extracted file text.
-- If the query type is 'image', use both OCR and visual analysis.
-- If the query type is 'mixed', combine all sources intelligently.
-- Always give a clear, helpful answer without referencing system details.
-"""
-
-    # Build conversation
-    messages = [{"role": "system", "content": system_prompt}]
-
-    for interaction in reversed(history):
-        messages.append({"role": "user", "content": interaction["message_text"]})
-        messages.append({"role": "assistant", "content": interaction["response_text"]})
-
-    # Build latest user content
-    latest_user_content = [{"type": "text", "text": user_message}]
-
-    if combined_extracted_text.strip():
-        latest_user_content.append({
-            "type": "text",
-            "text": f"\n\nBelow is the extracted text from the uploaded file/image:\n{combined_extracted_text}"
-        })
-    elif images:
-        latest_user_content.append({
-            "type": "text",
-            "text": "\n\nNo extracted text available — analyze the image visually."
-        })
-
-    # Attach images if any
-    if images:
-        for img_bytes in images:
-            detected_format = imghdr.what(None, h=img_bytes)
-            mime_type = f"image/{detected_format}" if detected_format else "image/jpeg"
-            b64_image = base64.b64encode(img_bytes).decode("utf-8")
-            latest_user_content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}
-            })
-
-    messages.append({"role": "user", "content": latest_user_content})
-
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o",  # multimodal
-            messages=messages,
-            temperature=0.7
+        # --- GPT API Call (new SDK style) ---
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_prompt},
+            ],
+            temperature=0.4,
+            max_tokens=1000,
         )
+
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        print("❌ OpenAI API Error:")
         traceback.print_exc()
-        return "❌ Failed to get a response from GPT."
+        return f"⚠️ Error in ask_gpt: {str(e)}"
+
+
+
